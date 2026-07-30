@@ -2,60 +2,118 @@
 /**
  * Perplexity Direct HTTP Client — Aurora Mode
  *
- * Extracts httpOnly session cookie once from Chrome (via CDP proxy /cookies),
- * then makes direct HTTP requests from Node. Cookie is refreshed periodically
- * and on 403 errors.
+ * Architecture (matches aurora-ops pattern):
+ *   1. Cookie read from session.txt (put there once, never committed)
+ *   2. If missing, extracted once from Chrome via CDP proxy /cookies
+ *   3. Refreshed via pure HTTP: GET /api/auth/session → Set-Cookie
+ *   4. Only falls back to CDP when the cookie itself fully expires (~30 days)
+ *
+ * Zero CDP dependency during normal operation. CDP is only a
+ * bootstrap/recovery mechanism.
  */
 
 import { randomUUID } from 'node:crypto';
-import { readFileSync, statSync } from 'node:fs';
-import { basename } from 'node:path';
+import { readFileSync, writeFileSync, existsSync, statSync } from 'node:fs';
+import { basename, join } from 'node:path';
+import { homedir } from 'node:os';
 
 const PROXY = process.env.CDP_PROXY || 'http://localhost:3456';
 const BASE_URL = 'https://www.perplexity.ai';
+const SESSION_FILE = process.env.PERPLEXITY_SESSION_FILE || join(homedir(), '.perplexity-session.txt');
 
 // ─── Cookie Manager ────────────────────────────────────────
 
 class CookieManager {
   constructor() {
-    this._cookie = null;
+    this._value = null;
     this._expires = 0;
     this._refreshTimer = null;
-    this._accountId = null;
     this._userAgent = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36';
   }
 
-  async _fetchFromCDP() {
-    // Get Perplexity tab from CDP proxy
+  /** Extract cookie from Chrome via CDP proxy (bootstrap/recovery only) */
+  async _extractFromCDP() {
     const targetsResp = await fetch(`${PROXY}/targets`);
     const targets = await targetsResp.json();
     const pplxTab = targets.find(t => t.url?.includes('perplexity.ai') && !t.url?.includes('service-worker'));
-    if (!pplxTab) throw new Error('No Perplexity tab found in Chrome');
+    if (!pplxTab) throw new Error('No Perplexity tab in Chrome — open perplexity.ai first');
 
     const cookiesResp = await fetch(`${PROXY}/cookies?target=${pplxTab.targetId}&url=${encodeURIComponent(BASE_URL)}`);
     const { cookies } = await cookiesResp.json();
-
     const sessionCookie = cookies.find(c => c.name === '__Secure-next-auth.session-token');
-    if (!sessionCookie) throw new Error('Session cookie not found — log into Perplexity in Chrome first');
-    
-    return sessionCookie;
+    if (!sessionCookie) throw new Error('Session cookie not found — log into Perplexity in Chrome');
+
+    return sessionCookie.value;
+  }
+
+  /** Refresh cookie via HTTP (same pattern as aurora-ops refresh-token.py) */
+  async _refreshViaHTTP() {
+    const resp = await fetch(`${BASE_URL}/api/auth/session`, {
+      headers: {
+        'Cookie': `__Secure-next-auth.session-token=${this._value}`,
+        'User-Agent': this._userAgent,
+        'Origin': BASE_URL,
+      },
+    });
+
+    if (!resp.ok) return null;
+
+    // Extract new cookie from Set-Cookie header
+    const setCookie = resp.headers.getSetCookie?.() || resp.headers.get('set-cookie')?.split(', ') || [];
+    for (const sc of setCookie) {
+      const match = sc.match(/^__Secure-next-auth\.session-token=([^;]+)/);
+      if (match) return match[1];
+    }
+    return null;
+  }
+
+  async _loadOrBootstrap() {
+    // 1. Try session.txt file
+    if (existsSync(SESSION_FILE)) {
+      this._value = readFileSync(SESSION_FILE, 'utf-8').trim();
+      if (this._value) {
+        console.log('[cookie] Loaded from session.txt');
+        return;
+      }
+    }
+
+    // 2. Bootstrap from Chrome
+    console.log('[cookie] No session.txt, extracting from Chrome...');
+    this._value = await this._extractFromCDP();
+    writeFileSync(SESSION_FILE, this._value, { mode: 0o600 });
+    this._expires = Date.now() + 30 * 86400000; // ~30 days (Perplexity session)
+    console.log('[cookie] Extracted and saved to session.txt');
   }
 
   async refresh() {
-    const cookie = await this._fetchFromCDP();
-    this._cookie = cookie;
-    this._expires = cookie.expires ? cookie.expires * 1000 : Date.now() + 86400000;
+    // Try HTTP refresh first
+    if (this._value) {
+      const newCookie = await this._refreshViaHTTP();
+      if (newCookie) {
+        this._value = newCookie;
+        writeFileSync(SESSION_FILE, this._value, { mode: 0o600 });
+        this._expires = Date.now() + 30 * 86400000;
+        console.log('[cookie] Refreshed via HTTP');
+        this.valid = true;
+        return true;
+      }
+    }
+
+    // HTTP refresh failed — fall back to CDP bootstrap
+    console.log('[cookie] HTTP refresh failed, falling back to CDP extraction...');
+    this._value = await this._extractFromCDP();
+    writeFileSync(SESSION_FILE, this._value, { mode: 0o600 });
+    this._expires = Date.now() + 30 * 86400000;
     this.valid = true;
-    const hoursLeft = ((this._expires - Date.now()) / 3600000).toFixed(1);
-    console.log(`[cookie] Refreshed, expires in ${hoursLeft}h`);
+    console.log('[cookie] Refreshed via CDP');
     return true;
   }
 
   async init() {
-    await this.refresh();
-    // Refresh every 2 hours or 30 min before expiry, whichever comes first
-    const interval = Math.min(2 * 3600000, Math.max(600000, this._expires - Date.now() - 1800000));
-    this._refreshTimer = setInterval(() => this.refresh().catch(e => console.warn('[cookie] refresh failed:', e.message)), interval);
+    await this._loadOrBootstrap();
+    this.valid = true;
+    // Refresh every 24 hours via HTTP
+    this._refreshTimer = setInterval(() => this.refresh().catch(e => console.warn('[cookie] refresh failed:', e.message)), 24 * 3600000);
   }
 
   stop() {
@@ -63,14 +121,12 @@ class CookieManager {
   }
 
   getCookieHeader() {
-    if (!this._cookie) throw new Error('No session cookie');
-    return `${this._cookie.name}=${this._cookie.value}`;
+    if (!this._value) throw new Error('No session cookie');
+    return `__Secure-next-auth.session-token=${this._value}`;
   }
 
   async ensureValid() {
-    if (!this._cookie || Date.now() > this._expires - 600000) {
-      await this.refresh();
-    }
+    if (!this._value) await this.refresh();
   }
 }
 
