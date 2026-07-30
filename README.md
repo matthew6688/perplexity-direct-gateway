@@ -163,8 +163,47 @@ This is used internally by the gateway but can also be used standalone.
 |---|---|---|
 | `PORT` | `8788` | Server listen port |
 | `HOST` | `127.0.0.1` | Server listen host |
-| `CDP_PROXY` | `http://localhost:3456` | CDP proxy URL |
+| `CDP_PROXY` | `http://localhost:3456` | CDP proxy URL (bootstrap only) |
 | `PERPLEXITY_PROXY_KEY` | (none) | API key for request auth |
+| `PERPLEXITY_SESSION_FILE` | `~/.perplexity-session.txt` | Cookie file path |
+
+## Ops & Maintenance
+
+Operational tooling lives in [`perplexity-ops`](https://github.com/matthew6688/perplexity-ops)
+(same pattern as [`aurora-ops`](https://github.com/matthew6688/aurora-ops)):
+
+| Tool | Location | Purpose |
+|---|---|---|
+| `refresh-cookie.py` | `~/perplexity-ops/` | HTTP-refresh cookie via `/api/auth/session` |
+| `perplexity-direct.30s.sh` | `~/swiftbar-plugins/` | SwiftBar menu-bar status + start/stop/restart |
+| `ai.perplexity-direct.cookie-refresh.plist` | `~/Library/LaunchAgents/` | launchd auto-refresh every 12h |
+| `pplx-direct` | `~/.local/bin/` | One-line terminal CLI |
+
+```bash
+# Gateway lifecycle
+cd ~/perplexity-direct-gateway
+nohup node src/server.mjs >> ~/Library/Logs/perplexity-direct/server.log 2>&1 &
+# Or use the PPLX-D SwiftBar icon in the menu bar
+
+# Manual cookie refresh
+python3 ~/perplexity-ops/refresh-cookie.py
+# Or via SwiftBar: click PPLX-D → "Refresh cookie now"
+
+# Health + cookie age
+curl http://127.0.0.1:8788/health
+
+# One-line queries
+pplx-direct -m sonnet "question"
+pplx-direct --stream "question"
+```
+
+### Cookie lifecycle
+
+1. **Bootstrap** (once): cookie extracted from Chrome → `~/.perplexity-session.txt`
+2. **Gateway start**: reads from file, zero CDP
+3. **Every 12h (launchd)**: `refresh-cookie.py` calls `/api/auth/session` → `Set-Cookie` → writes file → `POST /refresh`
+4. **Gateway internal**: also refreshes every 24h via setInterval
+5. **CDP fallback**: only when cookie expires (~30 days) and HTTP refresh fails
 
 ## License
 
