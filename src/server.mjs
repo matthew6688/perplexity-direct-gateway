@@ -16,12 +16,15 @@
 
 import http from 'node:http';
 import { randomUUID } from 'node:crypto';
-import { existsSync } from 'node:fs';
+import { existsSync, statSync } from 'node:fs';
+import { join } from 'node:path';
+import { homedir } from 'node:os';
 import { getClient, uploadFile } from './perplexity.mjs';
 
 const PORT = parseInt(process.env.PORT || '8788', 10);
 const HOST = process.env.HOST || '127.0.0.1';
 const PROXY_KEY = process.env.PERPLEXITY_PROXY_KEY || '';
+const SESSION_FILE = process.env.PERPLEXITY_SESSION_FILE || join(homedir(), '.perplexity-session.txt');
 
 const MODEL_CATALOG = [
   'best',
@@ -128,12 +131,27 @@ const server = http.createServer(async (req, res) => {
 
     // GET /health
     if (path === '/health' && req.method === 'GET') {
+      const cookieAge = client?.cookies?._value
+        ? (() => { try { const m = statSync(SESSION_FILE); return Math.floor((Date.now() - m.mtimeMs) / 1000); } catch { return null; } })()
+        : null;
       return json(res, 200, {
         status: 'ok',
         provider: 'perplexity-direct',
         queueDepth: client?.queueDepth || 0,
         sessionAlive: client?.cookies?.valid || false,
+        cookieAgeSeconds: cookieAge,
       });
+    }
+
+    // POST /refresh — reload cookie from session file (for launchd/scheduled refresh)
+    if (path === '/refresh' && req.method === 'POST') {
+      try {
+        if (!client) return json(res, 503, buildError('gateway not initialized'));
+        await client.cookies.refresh();
+        return json(res, 200, { status: 'ok', refreshed: true });
+      } catch (e) {
+        return json(res, 500, buildError(`refresh failed: ${e.message}`));
+      }
     }
 
     // GET /v1/models
