@@ -1,0 +1,94 @@
+#!/usr/bin/env bash
+#
+# pplx-direct — one-line terminal query against the local Perplexity Direct
+# Gateway (:8788, Aurora-mode HTTP, no CDP per request).
+#
+# Usage:
+#   pplx-direct "question"
+#   pplx-direct -m sonnet "question"
+#   pplx-direct --stream "question"
+#   pplx-direct --json "question"
+
+set -uo pipefail
+
+API_URL="${PPLX_DIRECT_API_URL:-http://127.0.0.1:8788}"
+model=""
+stream=false
+raw_json=false
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -m|--model) model="$2"; shift 2 ;;
+    --stream) stream=true; shift ;;
+    --json) raw_json=true; shift ;;
+    -h|--help)
+      sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'
+      exit 0 ;;
+    --) shift; break ;;
+    *) break ;;
+  esac
+done
+
+prompt="$*"
+if [ -z "$prompt" ]; then
+  echo "usage: pplx-direct [-m model] [--stream] [--json] \"question\"" >&2
+  exit 1
+fi
+
+if ! curl -s -o /dev/null -m 3 "$API_URL/health"; then
+  echo "pplx-direct gateway isn't reachable at $API_URL" >&2
+  echo "Start it: cd ~/perplexity-direct-gateway && nohup node src/server.mjs >> ~/Library/Logs/perplexity-direct/server.log 2>&1 &" >&2
+  echo "Or use the PPLX-D SwiftBar icon." >&2
+  exit 1
+fi
+
+full_model="${model:-best}"
+
+body="$(node -e '
+const [prompt, model, stream, json] = process.argv.slice(1);
+const body = { model, messages: [{ role: "user", content: prompt }] };
+if (stream === "true") body.stream = true;
+process.stdout.write(JSON.stringify(body));
+' "$prompt" "$full_model" "$stream" "$raw_json")"
+
+if [ "$stream" = true ]; then
+  # Streaming: output chunks as they arrive
+  curl -s -N "$API_URL/v1/chat/completions" \
+    -H 'content-type: application/json' \
+    -d "$body" | while IFS= read -r line; do
+    if [[ "$line" == data:\ [DONE]* ]]; then break; fi
+    if [[ "$line" == data:\ * ]]; then
+      content="$(echo "${line#data: }" | node -e '
+        let d=""; process.stdin.on("data",c=>d+=c);
+        process.stdin.on("end",()=>{
+          try { const j=JSON.parse(d); process.stdout.write(j.choices[0].delta.content||""); } catch {}
+        });' 2>/dev/null)"
+      [ -n "$content" ] && printf "%s" "$content"
+    fi
+  done
+  echo
+  exit 0
+fi
+
+response="$(curl -s "$API_URL/v1/chat/completions" -H 'content-type: application/json' -d "$body")"
+
+if [ "$raw_json" = true ]; then
+  echo "$response"
+  exit 0
+fi
+
+echo "$response" | node -e '
+let data = "";
+process.stdin.on("data", (d) => (data += d));
+process.stdin.on("end", () => {
+  const r = JSON.parse(data);
+  if (r.error) {
+    console.error("error: " + r.error.message);
+    process.exit(1);
+  }
+  console.log(r.choices[0].message.content);
+  if (r.citations && r.citations.length) {
+    console.log("\nCitations:");
+    r.citations.forEach((c, i) => console.log(`  [${i+1}] ${c.title || c.url}: ${c.url}`));
+  }
+});'

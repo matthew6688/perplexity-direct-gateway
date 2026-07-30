@@ -169,15 +169,32 @@ This is used internally by the gateway but can also be used standalone.
 
 ## Ops & Maintenance
 
-Operational tooling lives in [`perplexity-ops`](https://github.com/matthew6688/perplexity-ops)
-(same pattern as [`aurora-ops`](https://github.com/matthew6688/aurora-ops)):
+All operational tooling lives in `ops/` alongside the gateway code:
 
-| Tool | Location | Purpose |
-|---|---|---|
-| `refresh-cookie.py` | `~/perplexity-ops/` | HTTP-refresh cookie via `/api/auth/session` |
-| `perplexity-direct.30s.sh` | `~/swiftbar-plugins/` | SwiftBar menu-bar status + start/stop/restart |
-| `ai.perplexity-direct.cookie-refresh.plist` | `~/Library/LaunchAgents/` | launchd auto-refresh every 12h |
-| `pplx-direct` | `~/.local/bin/` | One-line terminal CLI |
+| Tool | Purpose |
+|---|---|
+| `ops/refresh-cookie.py` | HTTP-refresh cookie via `/api/auth/session` |
+| `ops/swiftbar/perplexity-direct.30s.sh` | SwiftBar menu-bar status + start/stop/restart |
+| `ops/launchd/ai.perplexity-direct.cookie-refresh.plist` | launchd auto-refresh every 12h |
+| `ops/bin/pplx-direct` | One-line terminal CLI |
+
+Live locations are symlinks into this repo:
+
+```
+~/swiftbar-plugins/perplexity-direct.30s.sh              → ops/swiftbar/perplexity-direct.30s.sh
+~/.local/bin/pplx-direct                                 → ops/bin/pplx-direct
+~/Library/LaunchAgents/ai.perplexity-direct.cookie-refresh.plist
+                                                         → ops/launchd/ai.perplexity-direct.cookie-refresh.plist
+```
+
+Setup on a fresh machine:
+
+```bash
+ln -sf ~/perplexity-direct-gateway/ops/swiftbar/perplexity-direct.30s.sh ~/swiftbar-plugins/
+ln -sf ~/perplexity-direct-gateway/ops/bin/pplx-direct ~/.local/bin/
+ln -sf ~/perplexity-direct-gateway/ops/launchd/ai.perplexity-direct.cookie-refresh.plist ~/Library/LaunchAgents/
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/ai.perplexity-direct.cookie-refresh.plist
+```
 
 ```bash
 # Gateway lifecycle
@@ -186,7 +203,7 @@ nohup node src/server.mjs >> ~/Library/Logs/perplexity-direct/server.log 2>&1 &
 # Or use the PPLX-D SwiftBar icon in the menu bar
 
 # Manual cookie refresh
-python3 ~/perplexity-ops/refresh-cookie.py
+python3 ops/refresh-cookie.py
 # Or via SwiftBar: click PPLX-D → "Refresh cookie now"
 
 # Health + cookie age
