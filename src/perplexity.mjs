@@ -1,410 +1,394 @@
 #!/usr/bin/env node
 /**
- * Perplexity Direct HTTP Client
- * 
- * Talks directly to Perplexity's web API (POST /rest/sse/perplexity_ask)
- * using cookie-based auth, bypassing the browser/OpenCLI entirely.
- * 
- * This is the Aurora-equivalent for Perplexity.
+ * Perplexity Direct HTTP Client — Aurora Mode
+ *
+ * Extracts httpOnly session cookie once from Chrome (via CDP proxy /cookies),
+ * then makes direct HTTP requests from Node. Cookie is refreshed periodically
+ * and on 403 errors.
  */
 
 import { randomUUID } from 'node:crypto';
 import { readFileSync, statSync } from 'node:fs';
 import { basename } from 'node:path';
-import { getCookieHeader } from './cookies.mjs';
 
+const PROXY = process.env.CDP_PROXY || 'http://localhost:3456';
 const BASE_URL = 'https://www.perplexity.ai';
-const ASK_ENDPOINT = '/rest/sse/perplexity_ask';
-const UPLOAD_URL_ENDPOINT = '/rest/uploads/create_upload_url';
-const BATCH_UPLOAD_URL_ENDPOINT = '/rest/uploads/batch_create_upload_urls';
 
-/**
- * Model mapping: our short names → Perplexity's model_preference values.
- * 
- * Perplexity sources models from different providers:
- *   Sonar      → Perplexity in-house
- *   Terra/Sol  → OpenAI (GPT-5.6)  
- *   Sonnet/Opus→ Anthropic (Claude)
- *   Gemini     → Google
- *   Grok       → xAI
- *   GLM        → Zhipu AI (China)
- *   Kimi       → Moonshot AI (China)
- *   Nemotron   → NVIDIA
- *   Best       → Auto-select
- */
-/**
- * Model mapping: our short names → Perplexity's actual model_preference IDs.
- * 
- * Real IDs from /rest/models/config/v2:
- *   experimental  → Sonar 2 (Perplexity in-house, default)
- *   turbo         → Best (auto-select)
- *   gpt5, gpt51, gpt52, gpt54, gpt55, gpt54_thinking, etc → OpenAI
- *   claude_sonnet_5, claude_opus_4_8 → Anthropic
- *   gemini_3_1_pro → Google
- *   grok_4_5 → xAI
- *   glm_5_2 → Zhipu AI
- *   kimi_k2_6 → Moonshot AI
- *   nemotron_3_ultra → NVIDIA
- */
-const MODEL_MAP = {
-  '': 'turbo',
-  'default': 'turbo',
-  'best': 'turbo',
-  'auto': 'turbo',
-  'sonar': 'experimental',
-  'sonar-2': 'experimental',
-  // OpenAI
-  'gpt-5': 'gpt5',
-  'gpt-5.1': 'gpt51',
-  'gpt-5.2': 'gpt52',
-  'gpt-5.4': 'gpt54',
-  'gpt-5.5': 'gpt55',
-  'gpt-5.6': 'gpt56_terra',
-  'terra': 'gpt56_terra',
-  'terra-thinking': 'gpt56_terra_thinking',
-  'sol': 'gpt56_sol',
-  'sol-thinking': 'gpt56_sol_thinking',
-  'gpt-5-thinking': 'gpt5_thinking',
-  'gpt-5.2-thinking': 'gpt52_thinking',
-  'gpt-5.4-thinking': 'gpt54_thinking',
-  'gpt-5.5-thinking': 'gpt55_thinking',
-  // Anthropic  
-  'sonnet': 'claude50sonnet',
-  'sonnet-thinking': 'claude50sonnetthinking',
-  'opus': 'claude50opus',
-  'opus-thinking': 'claude50opusthinking',
-  'haiku': 'claude45haiku',
-  // Google
-  'gemini': 'gemini31pro_low',
-  'gemini-pro': 'gemini31pro_low',
-  'gemini-flash': 'gemini35flash',
-  // xAI
-  'grok': 'grok45low',
-  'grok-4': 'grok4nonthinking',
-  // Zhipu
-  'glm': 'glm_5_2',
-  // Moonshot
-  'kimi': 'kimik26instant',
-  'kimi-thinking': 'kimik26thinking',
-  // NVIDIA
-  'nemotron': 'nv_nemotron_3_ultra',
-};
+// ─── Cookie Manager ────────────────────────────────────────
 
-/**
- * Build the request body for POST /rest/sse/perplexity_ask
- */
-function buildRequestBody(queryStr, { model = '', mode = 'copilot', searchFocus = 'internet', attachments = [] } = {}) {
-  const frontendUuid = randomUUID();
-  const readWriteToken = randomUUID();
-  
-  return {
-    params: {
-      last_backend_uuid: null,        // null = new conversation
-      read_write_token: readWriteToken,
-      attachments: attachments,        // S3 URLs or data URIs
-      language: 'en-US',
-      timezone: 'Australia/Brisbane',
-      search_focus: searchFocus,
-      sources: ['web'],
-      frontend_uuid: frontendUuid,
-      mode: mode,                      // "copilot" = default, "research" = deep research
-      model_preference: MODEL_MAP[model] || model || 'experimental',
-      is_related_query: false,
-      is_sponsored: false,
-      prompt_source: 'user',
-      query_source: 'new',             // "new" for new conversation, "followup" for follow-up
-      is_incognito: false,
-      time_from_first_type: 0,
-      local_search_enabled: false,
-      use_schematized_api: true,
-      send_back_text_in_streaming_api: false,
-      supported_block_use_cases: [
-        'answer_modes', 'markdown_block', 'sources_mode_block',
-        'diff_blocks', 'answer_tabs',
-      ],
-      client_coordinates: null,
-      mentions: [],
-      skip_search_enabled: true,
-      is_nav_suggestions_disabled: false,
-      followup_source: 'link',
-      source: 'default',
-      always_search_override: false,
-      override_no_search: false,
-      should_ask_for_mcp_tool_confirmation: true,
-      supports_tool_approval_modal: true,
-      force_enable_browser_agent: false,
-      supported_features: ['browser_agent_permission_banner_v1.1'],
-      extended_context: false,
-      is_local_browser_available: false,
-      is_local_browser_allowed: false,
-      version: '2.18',
-      rum_session_id: randomUUID(),
-    },
-    query_str: queryStr,
-  };
+class CookieManager {
+  constructor() {
+    this._cookie = null;
+    this._expires = 0;
+    this._refreshTimer = null;
+    this._accountId = null;
+    this._userAgent = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36';
+  }
+
+  async _fetchFromCDP() {
+    // Get Perplexity tab from CDP proxy
+    const targetsResp = await fetch(`${PROXY}/targets`);
+    const targets = await targetsResp.json();
+    const pplxTab = targets.find(t => t.url?.includes('perplexity.ai') && !t.url?.includes('service-worker'));
+    if (!pplxTab) throw new Error('No Perplexity tab found in Chrome');
+
+    const cookiesResp = await fetch(`${PROXY}/cookies?target=${pplxTab.targetId}&url=${encodeURIComponent(BASE_URL)}`);
+    const { cookies } = await cookiesResp.json();
+
+    const sessionCookie = cookies.find(c => c.name === '__Secure-next-auth.session-token');
+    if (!sessionCookie) throw new Error('Session cookie not found — log into Perplexity in Chrome first');
+    
+    return sessionCookie;
+  }
+
+  async refresh() {
+    const cookie = await this._fetchFromCDP();
+    this._cookie = cookie;
+    this._expires = cookie.expires ? cookie.expires * 1000 : Date.now() + 86400000;
+    this.valid = true;
+    const hoursLeft = ((this._expires - Date.now()) / 3600000).toFixed(1);
+    console.log(`[cookie] Refreshed, expires in ${hoursLeft}h`);
+    return true;
+  }
+
+  async init() {
+    await this.refresh();
+    // Refresh every 2 hours or 30 min before expiry, whichever comes first
+    const interval = Math.min(2 * 3600000, Math.max(600000, this._expires - Date.now() - 1800000));
+    this._refreshTimer = setInterval(() => this.refresh().catch(e => console.warn('[cookie] refresh failed:', e.message)), interval);
+  }
+
+  stop() {
+    if (this._refreshTimer) { clearInterval(this._refreshTimer); this._refreshTimer = null; }
+  }
+
+  getCookieHeader() {
+    if (!this._cookie) throw new Error('No session cookie');
+    return `${this._cookie.name}=${this._cookie.value}`;
+  }
+
+  async ensureValid() {
+    if (!this._cookie || Date.now() > this._expires - 600000) {
+      await this.refresh();
+    }
+  }
 }
 
-/**
- * Parse SSE events from Perplexity's streaming response.
- * Yields { text, citations, status, threadUrl } as the stream progresses.
- */
-async function* parseSSEStream(response) {
-  const reader = response.body.getReader();
-  const decoder = new TextDecoder();
-  let buffer = '';
-  let currentEvent = 'message';
-  
-  let fullText = '';
-  let threadUrl = '';
-  let citations = [];
-  let done = false;
+// ─── Human behavior simulation ────────────────────────────
 
-  while (!done) {
-    const { value, done: streamDone } = await reader.read();
-    if (streamDone) break;
-    
-    buffer += decoder.decode(value, { stream: true });
-    const lines = buffer.split('\r\n');
-    buffer = lines.pop() || ''; // Keep incomplete line
-    
+function humanDelay() { return 2000 + Math.random() * 5000; }
+function typingTime(queryLength) { return Math.floor(Math.min(queryLength * 15, 3000) + Math.random() * 2000); }
+
+// ─── Serial Request Queue ──────────────────────────────────
+
+class RequestQueue {
+  constructor(maxDepth = 50) {
+    this._tail = Promise.resolve();
+    this._depth = 0;
+    this._maxDepth = maxDepth;
+  }
+  get depth() { return this._depth; }
+  async enqueue(task, label = '') {
+    if (this._depth >= this._maxDepth) throw new QueueFullError(`Queue full (${this._depth}/${this._maxDepth})`);
+    this._depth++;
+    const run = this._tail.then(async () => {
+      if (this._depth > 1) {
+        const delay = humanDelay();
+        console.log(`[queue] Waiting ${(delay/1000).toFixed(1)}s before "${label}"... (depth: ${this._depth})`);
+        await new Promise(r => setTimeout(r, delay));
+      }
+      return task();
+    }, task);
+    this._tail = run.catch(() => {});
+    try { return await run; } finally { this._depth--; }
+  }
+}
+class QueueFullError extends Error { constructor(msg) { super(msg); this.name = 'QueueFullError'; } }
+
+// ─── Model mapping ─────────────────────────────────────────
+
+const MODEL_MAP = {
+  '': 'turbo', 'default': 'turbo', 'best': 'turbo', 'auto': 'turbo',
+  'sonar': 'experimental', 'sonar-2': 'experimental',
+  'gemini': 'gemini31pro_low', 'gemini-thinking': 'gemini31pro_high',
+  'sonnet': 'claude50sonnet', 'sonnet-thinking': 'claude50sonnetthinking',
+  'kimi': 'kimik3thinking', 'glm': 'glm_5_2',
+  'grok': 'grok45low', 'grok-thinking': 'grok45medium',
+  'nemotron': 'nv_nemotron_3_ultra',
+};
+const FALLBACK_CHAIN = ['turbo', 'experimental'];
+
+// ─── Perplexity Client ─────────────────────────────────────
+
+export class PerplexityClient {
+  constructor() {
+    this.cookies = new CookieManager();
+    this.queue = new RequestQueue(50);
+    this._rumSessionId = randomUUID();
+    this._queryCount = 0;
+  }
+
+  async start() { await this.cookies.init(); console.log('[client] Ready.'); }
+  async stop() { this.cookies.stop(); }
+  get queueDepth() { return this.queue.depth; }
+
+  async _askDirect(queryStr, options = {}) {
+    this._queryCount++;
+    await this.cookies.ensureValid();
+    const modelId = MODEL_MAP[options.model] || options.model || 'turbo';
+    const cookie = this.cookies.getCookieHeader();
+
+    const body = JSON.stringify({
+      params: {
+        last_backend_uuid: null, read_write_token: randomUUID(),
+        attachments: options.attachments || [],
+        language: 'en-US', timezone: 'Australia/Brisbane',
+        search_focus: 'internet', sources: ['web'],
+        frontend_uuid: randomUUID(), mode: options.mode || 'copilot',
+        model_preference: modelId,
+        is_related_query: false, is_sponsored: false,
+        prompt_source: 'user',
+        query_source: this._queryCount % 7 === 0 ? 'followup' : 'new',
+        is_incognito: false,
+        time_from_first_type: typingTime(queryStr.length),
+        local_search_enabled: false,
+        use_schematized_api: true, send_back_text_in_streaming_api: false,
+        supported_block_use_cases: [
+          'answer_modes', 'media_items', 'knowledge_cards',
+          'inline_entity_cards', 'place_widgets', 'finance_widgets',
+          'sports_widgets', 'news_widgets', 'shopping_widgets',
+          'jobs_widgets', 'search_result_widgets', 'inline_images',
+          'inline_assets', 'placeholder_cards', 'diff_blocks',
+          'inline_knowledge_cards', 'entity_group_v2', 'refinement_filters',
+          'canvas_mode', 'maps_preview', 'answer_tabs',
+          'price_comparison_widgets', 'preserve_latex',
+          'generic_onboarding_widgets', 'in_context_suggestions',
+          'pending_followups', 'inline_claims', 'unified_assets',
+          'workflow_steps', 'workflow_widgets', 'navigation_results',
+          'background_agents', 'markdown_block', 'sources_mode_block',
+        ],
+        client_coordinates: null, mentions: [],
+        skip_search_enabled: true, is_nav_suggestions_disabled: false,
+        followup_source: 'link', source: 'default',
+        always_search_override: false, override_no_search: false,
+        should_ask_for_mcp_tool_confirmation: true,
+        supports_tool_approval_modal: true, force_enable_browser_agent: false,
+        supported_features: ['browser_agent_permission_banner_v1.1'],
+        extended_context: false, is_local_browser_available: false,
+        is_local_browser_allowed: false,
+        version: '2.18', rum_session_id: this._rumSessionId,
+      },
+      query_str: queryStr,
+    });
+
+    const resp = await fetch(`${BASE_URL}/rest/sse/perplexity_ask`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Cookie': cookie,
+        'User-Agent': this.cookies._userAgent,
+        'Origin': BASE_URL,
+        'Referer': `${BASE_URL}/search`,
+        'Accept': 'text/event-stream',
+      },
+      body,
+    });
+
+    if (resp.status === 403) {
+      console.warn('[client] 403 — refreshing cookie and retrying');
+      await this.cookies.refresh();
+      throw new PerplexityError('SESSION_EXPIRED', 'Session expired — cookie refreshed');
+    }
+
+    if (!resp.ok) {
+      const text = await resp.text().catch(() => '');
+      throw new PerplexityError(`HTTP_${resp.status}`, text.slice(0, 500));
+    }
+
+    return resp.text();
+  }
+
+  async *_parseSSE(text) {
+    const lines = text.split('\r\n');
+    let fullText = '', threadUrl = '', citations = [], cursor = null;
     for (const line of lines) {
-      if (line.startsWith('event: ')) {
-        currentEvent = line.slice(7).trim();
-        continue;
-      }
-      
       if (!line.startsWith('data: ')) continue;
-      
-      const dataStr = line.slice(6);
       let data;
-      try {
-        data = JSON.parse(dataStr);
-      } catch {
-        continue;
-      }
-      
-      // Check for completion
-      if (currentEvent === 'end_of_stream' || data.final_sse_message) {
-        done = true;
-      }
-      
-      // Capture thread URL
-      if (data.thread_url_slug) {
-        threadUrl = `https://www.perplexity.ai/search/${data.thread_url_slug}`;
-      }
-      
-      // Extract text from blocks
+      try { data = JSON.parse(line.slice(6)); } catch { continue; }
+      if (data.cursor) cursor = data.cursor;
+      if (data.thread_url_slug) threadUrl = `${BASE_URL}/search/${data.thread_url_slug}`;
+      if (data.error_code) throw new PerplexityError(data.error_code, data.text || 'Unknown error');
       if (data.blocks) {
         for (const block of data.blocks) {
-          
-          // Full markdown_block answer
           if (block.markdown_block?.answer) {
             fullText = block.markdown_block.answer;
-            yield { text: fullText, citations, status: data.status, threadUrl, final: true };
+            yield { text: fullText, citations, status: data.status, threadUrl, cursor, final: true };
           }
-          
-          // Markdown from markdown block
-          if (block.markdown_block?.markdown) {
-            fullText = block.markdown_block.markdown;
-            yield { text: fullText, citations, status: data.status, threadUrl, final: true };
-          }
-          
-          // Incremental markdown_block chunks
           if (block.markdown_block?.chunks) {
-            const newChunks = block.markdown_block.chunks;
-            const newText = newChunks.join('');
-            if (newText.length > fullText.length) {
-              fullText = newText;
-              yield { text: fullText, citations, status: data.status, threadUrl, final: false };
+            const text = block.markdown_block.chunks.join('');
+            if (text.length > fullText.length) {
+              fullText = text;
+              yield { text: fullText, citations, status: data.status, threadUrl, cursor, final: false };
             }
           }
-          
-          // Sources/citations
           if (block.sources_mode_block?.web_results) {
             citations = block.sources_mode_block.web_results.map(r => ({
-              title: r.name || '',
-              url: r.url || '',
-              snippet: r.snippet || '',
+              title: r.name || '', url: r.url || '', snippet: r.snippet || '',
             }));
-            yield { text: fullText, citations, status: data.status, threadUrl, final: false };
-          }
-          
-          // JSON Patch diff blocks (incremental updates)
-          if (block.diff_block) {
-            // These contain incremental patches - we'll rely on markdown_block for final text
+            yield { text: fullText, citations, status: data.status, threadUrl, cursor, final: false };
           }
         }
       }
     }
+    if (fullText) yield { text: fullText, citations, status: 'COMPLETED', threadUrl, cursor, final: true };
   }
-  
-  // Final yield
-  if (fullText) {
-    yield { text: fullText, citations, status: 'COMPLETED', threadUrl, final: true };
+
+  async ask(queryStr, options = {}) {
+    let model = options.model || '';
+    let lastError = null;
+    let fallbackIdx = -1;
+
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        const sseText = await this._askDirect(queryStr, { ...options, model });
+        return this._parseSSE(sseText);
+      } catch (e) {
+        lastError = e;
+        if (e instanceof PerplexityError) {
+          if (e.code === 'SESSION_EXPIRED') { continue; }
+          if (e.code === 'INVALID_MODEL_SELECTION' || e.code?.startsWith('HTTP_4')) {
+            fallbackIdx++;
+            if (fallbackIdx < FALLBACK_CHAIN.length) {
+              model = FALLBACK_CHAIN[fallbackIdx];
+              console.warn(`[client] Model failed, falling back to "${model}"`);
+              await new Promise(r => setTimeout(r, 1000 + Math.random() * 2000));
+              continue;
+            }
+          }
+        }
+        if (attempt < 2) {
+          const delay = Math.pow(2, attempt) * 1000 + Math.random() * 1000;
+          console.warn(`[client] Retrying in ${(delay/1000).toFixed(1)}s...`);
+          await new Promise(r => setTimeout(r, delay));
+        }
+      }
+    }
+    throw lastError || new Error('All retries exhausted');
+  }
+
+  async askComplete(queryStr, options = {}) {
+    const stream = await this.ask(queryStr, options);
+    let result = { text: '', citations: [], threadUrl: '' };
+    for await (const chunk of stream) result = { ...result, ...chunk };
+    return result;
+  }
+
+  async enqueueAsk(queryStr, options = {}, label = '') {
+    return this.queue.enqueue(() => this.ask(queryStr, options), label || queryStr.slice(0, 50));
+  }
+
+  async enqueueAskComplete(queryStr, options = {}, label = '') {
+    return this.queue.enqueue(() => this.askComplete(queryStr, options), label || queryStr.slice(0, 50));
   }
 }
 
-/**
- * Upload a local file to Perplexity (S3) and return the S3 URL.
- * 
- * Flow: 
- *   1. POST /rest/uploads/create_upload_url → get S3 presigned fields + bucket URL
- *   2. POST to S3 with FormData → file lands on S3
- *   3. Returns the final S3 URL for use in attachments[]
- */
-export async function uploadFile(filePath) {
-  const cookies = await getCookieHeader();
+class PerplexityError extends Error {
+  constructor(code, message) { super(message); this.name = 'PerplexityError'; this.code = code; }
+}
+
+// ─── File Upload ───────────────────────────────────────────
+
+const MIME_MAP = {
+  'pdf': 'application/pdf', 'doc': 'application/msword',
+  'docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+  'pptx': 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+  'xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+  'txt': 'text/plain', 'text': 'text/plain', 'log': 'text/plain',
+  'csv': 'text/csv', 'md': 'text/markdown', 'markdown': 'text/markdown',
+  'htm': 'text/html', 'html': 'text/html',
+  'xml': 'application/xml', 'json': 'application/json',
+  'yaml': 'application/x-yaml', 'yml': 'application/x-yaml', 'toml': 'application/toml',
+  'py': 'text/x-python', 'js': 'text/javascript', 'mjs': 'text/javascript',
+  'ts': 'text/typescript', 'tsx': 'text/typescript', 'jsx': 'text/javascript',
+  'c': 'text/x-c', 'h': 'text/x-c', 'cpp': 'text/x-c++src', 'hpp': 'text/x-c++src',
+  'cxx': 'text/x-c++src', 'cs': 'text/x-csharp',
+  'java': 'text/x-java', 'go': 'text/x-go', 'rs': 'text/x-rust',
+  'swift': 'text/x-swift', 'kt': 'text/x-kotlin', 'scala': 'text/x-scala',
+  'dart': 'text/x-dart', 'lua': 'text/x-lua', 'rb': 'text/x-ruby',
+  'php': 'text/x-php', 'pl': 'text/x-perl', 'sql': 'text/x-sql',
+  'sh': 'text/x-sh', 'bash': 'text/x-sh', 'zsh': 'text/x-sh',
+  'css': 'text/css', 'less': 'text/css',
+  'png': 'image/png', 'jpg': 'image/jpeg', 'jpeg': 'image/jpeg',
+  'jpe': 'image/jpeg', 'gif': 'image/gif', 'bmp': 'image/bmp',
+  'tiff': 'image/tiff', 'tif': 'image/tiff', 'svg': 'image/svg+xml',
+  'webp': 'image/webp', 'ico': 'image/x-icon', 'avif': 'image/avif',
+  'heic': 'image/heic', 'heif': 'image/heif',
+  'mp3': 'audio/mpeg', 'wav': 'audio/wav', 'ogg': 'audio/ogg',
+  'mp4': 'video/mp4', 'mpeg': 'video/mpeg', 'mov': 'video/quicktime',
+  'webm': 'video/webm',
+};
+
+export async function uploadFile(filePath, cookieManager) {
   const stats = statSync(filePath);
   const fileName = basename(filePath);
   const fileBuffer = readFileSync(filePath);
-  
-  // Detect mime type from extension
   const ext = fileName.split('.').pop()?.toLowerCase() || '';
-  const mimeMap = {
-    'pdf': 'application/pdf',
-    'docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
-    'xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-    'csv': 'text/csv',
-    'txt': 'text/plain',
-    'png': 'image/png',
-    'jpg': 'image/jpeg',
-    'jpeg': 'image/jpeg',
-    'gif': 'image/gif',
-    'webp': 'image/webp',
-    'svg': 'image/svg+xml',
-    'mp3': 'audio/mpeg',
-    'mp4': 'video/mp4',
-    'wav': 'audio/wav',
-    'py': 'text/x-python',
-    'js': 'text/javascript',
-    'ts': 'text/typescript',
-    'json': 'application/json',
-    'html': 'text/html',
-    'css': 'text/css',
-    'md': 'text/markdown',
-    'yml': 'text/yaml',
-    'yaml': 'text/yaml',
-    'xml': 'text/xml',
-    'java': 'text/x-java',
-    'c': 'text/x-c',
-    'cpp': 'text/x-c++',
-    'go': 'text/x-go',
-    'rs': 'text/x-rust',
-    'sh': 'text/x-shellscript',
-  };
-  const mime = mimeMap[ext] || 'application/octet-stream';
-  
-  const headers = {
-    'Content-Type': 'application/json',
-    'Cookie': cookies,
-    'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36',
-    'Origin': 'https://www.perplexity.ai',
-    'Referer': 'https://www.perplexity.ai/',
-  };
-  
-  // Step 1: Get upload URL
-  const uploadReqBody = {
-    file_name: fileName,
-    file_size: stats.size,
-    mime_type: mime,
-    content_type: mime,
-    source: 'default',
-    version: '2.18',
-  };
-  
-  const uploadUrlResp = await fetch(`${BASE_URL}${UPLOAD_URL_ENDPOINT}`, {
+  const mime = MIME_MAP[ext] || 'application/octet-stream';
+  const cookie = cookieManager.getCookieHeader();
+
+  // Step 1: Get upload URL (direct HTTP, no CDP)
+  const urlResp = await fetch(`${BASE_URL}/rest/uploads/create_upload_url`, {
     method: 'POST',
-    headers,
-    body: JSON.stringify(uploadReqBody),
+    headers: {
+      'Content-Type': 'application/json',
+      'Cookie': cookie,
+      'User-Agent': cookieManager._userAgent,
+      'Origin': BASE_URL,
+    },
+    body: JSON.stringify({
+      filename: fileName, file_size: stats.size,
+      mime_type: mime, content_type: mime,
+      source: 'default', version: '2.18',
+    }),
   });
-  
-  if (!uploadUrlResp.ok) {
-    const errText = await uploadUrlResp.text();
-    throw new Error(`Failed to get upload URL: ${uploadUrlResp.status} ${errText.slice(0, 300)}`);
+
+  if (!urlResp.ok) {
+    const detail = await urlResp.text().catch(() => '');
+    throw new Error(`Upload URL failed (${urlResp.status}): ${detail.slice(0, 200)}`);
   }
-  
-  const uploadData = await uploadUrlResp.json();
-  console.log('[upload] Got upload URL:', JSON.stringify(uploadData).slice(0, 300));
-  
-  // Step 2: Upload to S3
-  const { fields, s3_bucket_url, file_uuid } = uploadData;
-  
-  if (!fields || !s3_bucket_url) {
-    // Direct URL return (some endpoints return the S3 URL directly)
-    if (uploadData.url) return uploadData.url;
-    if (uploadData.s3_url) return uploadData.s3_url;
-    throw new Error(`Upload response missing fields/s3_bucket_url: ${JSON.stringify(uploadData).slice(0, 300)}`);
-  }
-  
+
+  const uploadData = await urlResp.json();
+  const { fields, s3_bucket_url } = uploadData;
+  if (!fields || !s3_bucket_url) throw new Error('No S3 fields in upload response');
+
+  // Step 2: Upload to S3 (presigned URL, no auth needed)
   const formData = new FormData();
   for (const [key, val] of Object.entries(fields)) {
     formData.append(key, val);
   }
-  // The file field is typically named 'file'
   formData.append('file', new Blob([fileBuffer], { type: mime }), fileName);
-  
-  const s3Resp = await fetch(s3_bucket_url, {
-    method: 'POST',
-    body: formData,
-  });
-  
-  if (!s3Resp.ok) {
-    throw new Error(`S3 upload failed: ${s3Resp.status}`);
-  }
-  
-  // Construct the final S3 URL
+
+  const s3Resp = await fetch(s3_bucket_url, { method: 'POST', body: formData });
+  if (!s3Resp.ok) throw new Error(`S3 upload failed: ${s3Resp.status}`);
+
   const finalUrl = `${s3_bucket_url}${fields.key}`.replace('${filename}', fileName);
-  console.log(`[upload] File uploaded: ${filePath} -> ${finalUrl}`);
-  
-  return finalUrl;
+  console.log(`[upload] ${fileName} -> ${finalUrl}`);
+  return { file_name: fileName, file_size: stats.size, file_url: finalUrl, content_type: mime };
 }
 
-/**
- * Upload multiple files in batch.
- */
-export async function uploadFiles(filePaths) {
-  return Promise.all(filePaths.map(uploadFile));
+// ─── Singleton ─────────────────────────────────────────────
+
+let _client = null;
+
+export async function getClient() {
+  if (!_client) { _client = new PerplexityClient(); await _client.start(); }
+  return _client;
 }
 
-/**
- * Send a query to Perplexity and get the full answer.
- */
 export async function askPerplexity(queryStr, options = {}) {
-  const cookies = await getCookieHeader();
-  const body = buildRequestBody(queryStr, options);
-  
-  const response = await fetch(`${BASE_URL}${ASK_ENDPOINT}`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'Accept': 'text/event-stream',
-      'Cookie': cookies,
-      'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36',
-      'Origin': 'https://www.perplexity.ai',
-      'Referer': 'https://www.perplexity.ai/',
-    },
-    body: JSON.stringify(body),
-    redirect: 'follow',
-  });
-  
-  if (!response.ok) {
-    const errorText = await response.text();
-    throw new Error(`Perplexity API error ${response.status}: ${errorText.slice(0, 500)}`);
-  }
-  
-  return parseSSEStream(response);
+  return (await getClient()).ask(queryStr, options);
 }
 
-/**
- * Convenience: ask and get the full result (non-streaming).
- */
 export async function askPerplexityComplete(queryStr, options = {}) {
-  const stream = await askPerplexity(queryStr, options);
-  let result = { text: '', citations: [], threadUrl: '' };
-  
-  for await (const chunk of stream) {
-    result = { ...result, ...chunk };
-  }
-  
-  return result;
+  return (await getClient()).askComplete(queryStr, options);
 }

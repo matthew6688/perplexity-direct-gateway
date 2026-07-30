@@ -5,36 +5,39 @@
  * OpenAI-compatible HTTP API backed by Perplexity's web API.
  * No browser needed — direct HTTP calls with cookie auth.
  * 
+ * Features:
+ *   ◆ Serial request queue (protects your Pro account)
+ *   ◆ Cookie lifecycle management with auto-refresh
+ *   ◆ Human-like timing simulation
+ *   ◆ Retry with backoff + model fallback
+ * 
  * Usage: node src/server.mjs
  */
 
 import http from 'node:http';
 import { randomUUID } from 'node:crypto';
 import { existsSync } from 'node:fs';
-import { askPerplexity, askPerplexityComplete, uploadFile } from './perplexity.mjs';
+import { getClient, uploadFile } from './perplexity.mjs';
 
 const PORT = parseInt(process.env.PORT || '8788', 10);
 const HOST = process.env.HOST || '127.0.0.1';
 const PROXY_KEY = process.env.PERPLEXITY_PROXY_KEY || '';
 
-// Known models — these are the friendly names our gateway accepts
 const MODEL_CATALOG = [
   'best',
   'sonar',
-  'terra', 'terra-thinking',
-  'sol', 'sol-thinking',
-  'sonnet', 'sonnet-thinking',
-  'opus', 'opus-thinking',
-  'haiku',
-  'gemini', 'gemini-pro', 'gemini-flash',
-  'grok', 'grok-4',
+  'gemini',
+  'gemini-thinking',
+  'sonnet',
+  'sonnet-thinking',
+  'kimi',
   'glm',
-  'kimi', 'kimi-thinking',
+  'grok',
+  'grok-thinking',
   'nemotron',
-  // Raw model IDs for direct access
-  'gpt-5', 'gpt-5.1', 'gpt-5.2', 'gpt-5.4', 'gpt-5.5', 'gpt-5.6',
-  'gpt-5-thinking', 'gpt-5.2-thinking', 'gpt-5.4-thinking', 'gpt-5.5-thinking',
 ];
+
+// ─── Helpers ───────────────────────────────────────────────
 
 function json(res, status, data) {
   res.writeHead(status, { 'Content-Type': 'application/json' });
@@ -58,34 +61,28 @@ function buildPrompt(messages) {
   if (!Array.isArray(messages) || messages.length === 0) {
     throw new Error('messages must be a non-empty array');
   }
-
   const systemText = messages
     .filter(m => m.role === 'system')
     .map(m => typeof m.content === 'string' ? m.content : m.content?.map(c => c.text || '').join(''))
-    .filter(Boolean)
-    .join('\n\n');
-
+    .filter(Boolean).join('\n\n');
   const turns = messages.filter(m => m.role === 'user' || m.role === 'assistant');
-  if (turns.length === 0) throw new Error('messages must contain at least one user message');
-
+  if (turns.length === 0) throw new Error('at least one user message required');
   if (turns.length === 1 && !systemText) {
-    const content = turns[0].content;
-    return typeof content === 'string' ? content.trim() : content?.map(c => c.text || '').join('').trim();
+    const c = turns[0].content;
+    return (typeof c === 'string' ? c : c?.map(x => x.text || '').join('')).trim();
   }
-
   const parts = [];
   if (systemText) parts.push(`Instructions: ${systemText}`);
   for (const turn of turns) {
     const label = turn.role === 'assistant' ? 'Assistant' : 'User';
-    const text = typeof turn.content === 'string' ? turn.content.trim() : turn.content?.map(c => c.text || '').join('').trim();
+    const text = (typeof turn.content === 'string' ? turn.content : turn.content?.map(c => c.text || '').join('')).trim();
     if (text) parts.push(`${label}: ${text}`);
   }
   return parts.join('\n\n');
 }
 
 function estimateTokens(text) {
-  if (!text) return 0;
-  return Math.max(1, Math.ceil(text.length / 4));
+  return text ? Math.max(1, Math.ceil(text.length / 4)) : 0;
 }
 
 function parseBody(req) {
@@ -93,57 +90,53 @@ function parseBody(req) {
     let body = '';
     req.on('data', chunk => body += chunk);
     req.on('end', () => {
-      try {
-        resolve(body ? JSON.parse(body) : {});
-      } catch (e) {
-        reject(new Error('invalid JSON'));
-      }
+      try { resolve(body ? JSON.parse(body) : {}); }
+      catch (e) { reject(new Error('invalid JSON')); }
     });
   });
 }
 
-function buildStreamChunk(id, model, delta, finishReason = null) {
+function chunk(id, model, delta, finishReason = null) {
   return {
-    id,
-    object: 'chat.completion.chunk',
-    created: Math.floor(Date.now() / 1000),
-    model,
+    id, object: 'chat.completion.chunk',
+    created: Math.floor(Date.now() / 1000), model,
     choices: [{ index: 0, delta, finish_reason: finishReason }],
   };
 }
 
 // ─── Server ───────────────────────────────────────────────
 
+let client = null;
+
 const server = http.createServer(async (req, res) => {
   try {
-    // CORS
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
     res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
     
-    if (req.method === 'OPTIONS') {
-      res.writeHead(204);
-      return res.end();
-    }
+    if (req.method === 'OPTIONS') { res.writeHead(204); return res.end(); }
 
     const url = new URL(req.url, `http://${HOST}:${PORT}`);
     const path = url.pathname;
 
-    // Auth check
+    // Auth
     if (PROXY_KEY) {
       const auth = req.headers.authorization || '';
       const token = auth.startsWith('Bearer ') ? auth.slice(7) : '';
-      if (token !== PROXY_KEY) {
-        return json(res, 401, buildError('invalid API key', 'invalid_request_error'));
-      }
+      if (token !== PROXY_KEY) return json(res, 401, buildError('invalid API key', 'invalid_request_error'));
     }
 
-    // ─── GET /health ───
+    // GET /health
     if (path === '/health' && req.method === 'GET') {
-      return json(res, 200, { status: 'ok', provider: 'perplexity-direct' });
+      return json(res, 200, {
+        status: 'ok',
+        provider: 'perplexity-direct',
+        queueDepth: client?.queueDepth || 0,
+        sessionAlive: client?.cookies?.valid || false,
+      });
     }
 
-    // ─── GET /v1/models ───
+    // GET /v1/models
     if (path === '/v1/models' && req.method === 'GET') {
       const created = Math.floor(Date.now() / 1000);
       return json(res, 200, {
@@ -152,107 +145,70 @@ const server = http.createServer(async (req, res) => {
       });
     }
 
-    // ─── POST /v1/chat/completions ───
+    // POST /v1/chat/completions
     if (path === '/v1/chat/completions' && req.method === 'POST') {
       let body;
-      try {
-        body = await parseBody(req);
-      } catch (e) {
-        return json(res, 400, buildError(e.message, 'invalid_request_error'));
-      }
+      try { body = await parseBody(req); }
+      catch (e) { return json(res, 400, buildError(e.message, 'invalid_request_error')); }
 
       let promptText;
-      try {
-        promptText = buildPrompt(body.messages);
-      } catch (e) {
-        return json(res, 400, buildError(e.message, 'invalid_request_error'));
-      }
-
-      if (!promptText.trim()) {
-        return json(res, 400, buildError('prompt is empty', 'invalid_request_error'));
-      }
+      try { promptText = buildPrompt(body.messages); }
+      catch (e) { return json(res, 400, buildError(e.message, 'invalid_request_error')); }
+      if (!promptText.trim()) return json(res, 400, buildError('prompt is empty'));
 
       const model = String(body.model || '').replace(/^perplexity[-/]/i, '').toLowerCase();
-      const thinking = model.endsWith('-thinking') ? 'on' : '';
       const cleanModel = model.replace(/-thinking$/, '');
-      
       const mode = body.mode || (model.startsWith('research:') ? 'research' : 'copilot');
-      
-      // Handle file attachments: upload local files, pass through URLs
-      let attachmentUrls = [];
+
+      // Handle attachments
+      let attachmentObjs = [];
       if (body.attachments && Array.isArray(body.attachments)) {
         for (const att of body.attachments) {
           if (typeof att === 'string') {
-            // Check if it's a local file path
             if (existsSync(att)) {
-              console.log(`[server] Uploading attachment: ${att}`);
-              try {
-                const url = await uploadFile(att);
-                attachmentUrls.push(url);
-              } catch (e) {
-                console.error(`[server] Upload failed for ${att}:`, e.message);
-                return json(res, 400, buildError(`Failed to upload ${att}: ${e.message}`, 'invalid_request_error'));
-              }
-            } else if (att.startsWith('http://') || att.startsWith('https://') || att.startsWith('data:')) {
-              // URL or data URI - pass through directly
-              attachmentUrls.push(att);
+              try { attachmentObjs.push(await uploadFile(att, client.cookies)); }
+              catch (e) { return json(res, 400, buildError(`Upload failed: ${e.message}`)); }
+            } else if (att.startsWith('http') || att.startsWith('data:')) {
+              attachmentObjs.push({ file_url: att });
             } else {
-              return json(res, 400, buildError(`Attachment not found: ${att}`, 'invalid_request_error'));
+              return json(res, 400, buildError(`Attachment not found: ${att}`));
             }
-          } else if (att && typeof att === 'object' && att.path) {
-            // Support { path: '/local/file.pdf' } format too
-            if (existsSync(att.path)) {
-              try {
-                const url = await uploadFile(att.path);
-                attachmentUrls.push(url);
-              } catch (e) {
-                console.error(`[server] Upload failed for ${att.path}:`, e.message);
-                return json(res, 400, buildError(`Failed to upload ${att.path}: ${e.message}`, 'invalid_request_error'));
-              }
-            }
+          } else if (att && typeof att === 'object') {
+            attachmentObjs.push(att);
           }
         }
       }
-      
+
       try {
         if (body.stream) {
-          // ─── Streaming response ───
+          // ─── Streaming ───
           sse(res);
           const id = `chatcmpl-${randomUUID()}`;
-          const responseModel = body.model || 'perplexity';
+          const modelName = body.model || 'perplexity';
           
-          // Send role chunk
-          res.write(`data: ${JSON.stringify(buildStreamChunk(id, responseModel, { role: 'assistant' }))}\n\n`);
+          res.write(`data: ${JSON.stringify(chunk(id, modelName, { role: 'assistant' }))}\n\n`);
           
-          try {
-            const stream = await askPerplexity(promptText, { model: cleanModel, mode, attachments: attachmentUrls });
-            let lastText = '';
-            
-            for await (const chunk of stream) {
-              if (chunk.text && chunk.text !== lastText) {
-                // Send only the delta (new text since last yield)
-                const delta = chunk.text.slice(lastText.length);
-                if (delta) {
-                  res.write(`data: ${JSON.stringify(buildStreamChunk(id, responseModel, { content: delta }))}\n\n`);
-                }
-                lastText = chunk.text;
-              }
+          const stream = await client.enqueueAsk(promptText, {
+            model: cleanModel, mode, attachments: attachmentObjs,
+          }, promptText.slice(0, 40));
+          
+          let lastText = '';
+          for await (const c of stream) {
+            if (c.text && c.text !== lastText) {
+              const delta = c.text.slice(lastText.length);
+              if (delta) res.write(`data: ${JSON.stringify(chunk(id, modelName, { content: delta }))}\n\n`);
+              lastText = c.text;
             }
-          } catch (e) {
-            console.error('Stream error:', e.message);
           }
           
-          // Done
-          res.write(`data: ${JSON.stringify(buildStreamChunk(id, responseModel, {}, 'stop'))}\n\n`);
+          res.write(`data: ${JSON.stringify(chunk(id, modelName, {}, 'stop'))}\n\n`);
           res.write('data: [DONE]\n\n');
           return res.end();
-          
         } else {
-          // ─── Non-streaming response ───
-          const result = await askPerplexityComplete(promptText, { model: cleanModel, mode, attachments: attachmentUrls });
-          
-          const promptTokens = estimateTokens(promptText);
-          const completionTokens = estimateTokens(result.text);
+          // ─── Non-streaming ───
+          const result = await client.enqueueAskComplete(promptText, {
+            model: cleanModel, mode, attachments: attachmentObjs,
+          }, promptText.slice(0, 40));
           
           return json(res, 200, {
             id: `chatcmpl-${randomUUID()}`,
@@ -265,39 +221,42 @@ const server = http.createServer(async (req, res) => {
               finish_reason: 'stop',
             }],
             usage: {
-              prompt_tokens: promptTokens,
-              completion_tokens: completionTokens,
-              total_tokens: promptTokens + completionTokens,
+              prompt_tokens: estimateTokens(promptText),
+              completion_tokens: estimateTokens(result.text),
+              total_tokens: estimateTokens(promptText) + estimateTokens(result.text),
             },
             citations: result.citations || [],
             perplexity: {
               url: result.threadUrl || '',
-              model_applied: cleanModel || 'experimental',
+              model_applied: cleanModel || 'turbo',
             },
           });
         }
       } catch (e) {
-        console.error('Perplexity error:', e);
-        return json(res, 502, buildError(e.message, 'api_error'));
+        console.error('Perplexity error:', e.message);
+        const status = e.message?.includes('Queue full') ? 429 : 502;
+        return json(res, status, buildError(e.message));
       }
     }
 
-    // ─── 404 ───
     return json(res, 404, buildError(`unknown route ${req.method} ${path}`, 'invalid_request_error'));
-
   } catch (e) {
     console.error('Server error:', e);
-    if (!res.headersSent) {
-      json(res, 500, buildError('internal server error', 'server_error'));
-    }
+    if (!res.headersSent) json(res, 500, buildError('internal server error'));
     res.end();
   }
 });
 
+// ─── Startup ───────────────────────────────────────────────
+
+console.log('Starting Perplexity Direct Gateway...');
+const startClient = await getClient();
+client = startClient;
+console.log(`Session ready. Queue depth: ${client.queueDepth}`);
+
 server.listen(PORT, HOST, () => {
-  console.log(`perplexity-direct-gateway listening on http://${HOST}:${PORT}`);
-  if (!PROXY_KEY) console.log('PERPLEXITY_PROXY_KEY not set — server is unauthenticated, keep it bound to localhost.');
-  console.log(`Models: ${MODEL_CATALOG.join(', ')}`);
-  console.log('Endpoint: POST /v1/chat/completions');
-  console.log('Transport: direct HTTP → perplexity.ai/rest/sse/perplexity_ask (cookie auth)');
+  console.log(`Listening on http://${HOST}:${PORT}`);
+  console.log(`Models: ${MODEL_CATALOG.length} models across 8 providers`);
+  console.log(`Queue: serial FIFO, max 50, human-like delays`);
+  if (!PROXY_KEY) console.log('PERPLEXITY_PROXY_KEY not set — server is unauthenticated.');
 });
