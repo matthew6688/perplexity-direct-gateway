@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>ai.perplexity-direct.gateway</string>
+  <key>ProgramArguments</key><array>
+    <string>/opt/homebrew/bin/node</string>
+    <string>/Users/matthew/perplexity-direct-gateway/src/server.mjs</string>
+  </array>
+  <key>WorkingDirectory</key><string>/Users/matthew/perplexity-direct-gateway</string>
+  <key>EnvironmentVariables</key><dict>
+    <key>PERPLEXITY_DISABLE_CDP_FALLBACK</key><string>1</string>
+    <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+  </dict>
+  <key>RunAtLoad</key><true/>
+  <key>ProcessType</key><string>Background</string>
+  <key>ThrottleInterval</key><integer>60</integer>
+  <key>StandardOutPath</key><string>/Users/matthew/Library/Logs/perplexity-direct/server.log</string>
+  <key>StandardErrorPath</key><string>/Users/matthew/Library/Logs/perplexity-direct/server.error.log</string>
+</dict></plist>

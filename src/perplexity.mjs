@@ -20,6 +20,7 @@ import { homedir } from 'node:os';
 const PROXY = process.env.CDP_PROXY || 'http://localhost:3456';
 const BASE_URL = 'https://www.perplexity.ai';
 const SESSION_FILE = process.env.PERPLEXITY_SESSION_FILE || join(homedir(), '.perplexity-session.txt');
+const DISABLE_CDP_FALLBACK = process.env.PERPLEXITY_DISABLE_CDP_FALLBACK === '1';
 
 // ─── Cookie Manager ────────────────────────────────────────
 
@@ -77,6 +78,10 @@ class CookieManager {
       }
     }
 
+    if (DISABLE_CDP_FALLBACK) {
+      throw new Error('Session file missing and CDP fallback is disabled');
+    }
+
     // 2. Bootstrap from Chrome
     console.log('[cookie] No session.txt, extracting from Chrome...');
     this._value = await this._extractFromCDP();
@@ -97,6 +102,10 @@ class CookieManager {
         this.valid = true;
         return true;
       }
+    }
+
+    if (DISABLE_CDP_FALLBACK) {
+      throw new Error('HTTP session refresh failed and CDP fallback is disabled');
     }
 
     // HTTP refresh failed — fall back to CDP bootstrap
@@ -312,7 +321,8 @@ export class PerplexityClient {
         lastError = e;
         if (e instanceof PerplexityError) {
           if (e.code === 'SESSION_EXPIRED') { continue; }
-          if (e.code === 'INVALID_MODEL_SELECTION' || e.code?.startsWith('HTTP_4')) {
+          if ((e.code === 'INVALID_MODEL_SELECTION' || e.code?.startsWith('HTTP_4'))
+              && options.allowModelFallback !== false) {
             fallbackIdx++;
             if (fallbackIdx < FALLBACK_CHAIN.length) {
               model = FALLBACK_CHAIN[fallbackIdx];

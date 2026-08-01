@@ -32,6 +32,8 @@ New: Node → cookie → direct HTTP fetch → no timeout
 - Cookie lifecycle: auto-refresh every 2 hours or 30min before expiry
 - 403 auto-recovery: refresh cookie and retry
 - Retry with exponential backoff + model fallback chain
+- Optional `strict_model: true` request flag disables model fallback for
+  orchestrators that need an exact, auditable Provider/model attempt.
 
 ## Supported Models
 
@@ -95,6 +97,12 @@ curl http://localhost:8788/v1/chat/completions \
     "stream": false
   }'
 ```
+
+For a background-only production caller that must never touch Chrome during
+startup or recovery, start the gateway with
+`PERPLEXITY_DISABLE_CDP_FALLBACK=1`. In that mode a missing/expired session is
+reported as unhealthy instead of invoking CDP. Refresh the saved session
+explicitly before restarting.
 
 ### Streaming
 
@@ -176,6 +184,8 @@ All operational tooling lives in `ops/` alongside the gateway code:
 | `ops/refresh-cookie.py` | HTTP-refresh cookie via `/api/auth/session` |
 | `ops/swiftbar/perplexity-direct.30s.sh` | SwiftBar menu-bar status + start/stop/restart |
 | `ops/launchd/ai.perplexity-direct.cookie-refresh.plist` | launchd auto-refresh every 12h |
+| `ops/launchd/ai.perplexity-direct.gateway.plist` | background gateway; RunAtLoad once, no crash-loop KeepAlive |
+| `ops/install-gateway-launch-agent.sh` | install/reload the bounded gateway LaunchAgent |
 | `ops/bin/pplx-direct` | One-line terminal CLI |
 
 Live locations are symlinks into this repo:
@@ -185,6 +195,8 @@ Live locations are symlinks into this repo:
 ~/.local/bin/pplx-direct                                 → ops/bin/pplx-direct
 ~/Library/LaunchAgents/ai.perplexity-direct.cookie-refresh.plist
                                                          → ops/launchd/ai.perplexity-direct.cookie-refresh.plist
+~/Library/LaunchAgents/ai.perplexity-direct.gateway.plist
+                                                         → ops/launchd/ai.perplexity-direct.gateway.plist
 ```
 
 Setup on a fresh machine:
@@ -194,13 +206,14 @@ ln -sf ~/perplexity-direct-gateway/ops/swiftbar/perplexity-direct.30s.sh ~/swift
 ln -sf ~/perplexity-direct-gateway/ops/bin/pplx-direct ~/.local/bin/
 ln -sf ~/perplexity-direct-gateway/ops/launchd/ai.perplexity-direct.cookie-refresh.plist ~/Library/LaunchAgents/
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/ai.perplexity-direct.cookie-refresh.plist
+./ops/install-gateway-launch-agent.sh
 ```
 
 ```bash
-# Gateway lifecycle
-cd ~/perplexity-direct-gateway
-nohup node src/server.mjs >> ~/Library/Logs/perplexity-direct/server.log 2>&1 &
-# Or use the PPLX-D SwiftBar icon in the menu bar
+# Gateway lifecycle. The LaunchAgent runs once at login and intentionally has
+# no KeepAlive restart loop. An operator or Provider `prepare` can kickstart it
+# once after a visible failure.
+./ops/install-gateway-launch-agent.sh
 
 # Manual cookie refresh
 python3 ops/refresh-cookie.py

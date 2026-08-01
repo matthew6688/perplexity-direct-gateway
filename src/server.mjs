@@ -225,7 +225,10 @@ const server = http.createServer(async (req, res) => {
         } else {
           // ─── Non-streaming ───
           const result = await client.enqueueAskComplete(promptText, {
-            model: cleanModel, mode, attachments: attachmentObjs,
+            model: cleanModel,
+            mode,
+            attachments: attachmentObjs,
+            allowModelFallback: body.strict_model !== true,
           }, promptText.slice(0, 40));
           
           return json(res, 200, {
