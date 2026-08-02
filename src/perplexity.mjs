@@ -274,7 +274,11 @@ export class PerplexityClient {
   }
 
   async *_parseSSE(text) {
-    const lines = text.split('\r\n');
+    // Perplexity's upstream SSE response is not consistent about its line
+    // ending. Some responses use CRLF while others use LF. Splitting only on
+    // CRLF turns a valid LF-only stream into one unparsable `data:` line,
+    // which then looks like a successful request with an empty answer.
+    const lines = text.split(/\r?\n/);
     let fullText = '', threadUrl = '', citations = [], cursor = null;
     for (const line of lines) {
       if (!line.startsWith('data: ')) continue;
