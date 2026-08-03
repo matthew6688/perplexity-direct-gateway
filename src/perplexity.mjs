@@ -217,7 +217,11 @@ export class PerplexityClient {
         is_incognito: false,
         time_from_first_type: typingTime(queryStr.length),
         local_search_enabled: false,
-        use_schematized_api: true, send_back_text_in_streaming_api: false,
+        use_schematized_api: true,
+        // The upstream API occasionally emits citations and completion status
+        // without a markdown block when this is false. We need the answer in
+        // the SSE body so an empty completion is observable and retryable.
+        send_back_text_in_streaming_api: true,
         supported_block_use_cases: [
           'answer_modes', 'media_items', 'knowledge_cards',
           'inline_entity_cards', 'place_widgets', 'finance_widgets',
@@ -280,26 +284,49 @@ export class PerplexityClient {
     // which then looks like a successful request with an empty answer.
     const lines = text.split(/\r?\n/);
     let fullText = '', threadUrl = '', citations = [], cursor = null;
+    let eventCount = 0, blockCount = 0;
+    const eventShapes = new Set();
+    const textFrom = (value) => {
+      if (typeof value === 'string') {
+        const trimmed = value.trim();
+        // Recent upstream responses may wrap every search step and the final
+        // answer in one JSON array. Persisting the trace as answer creates a
+        // huge, unusable CRM artifact; select only FINAL.answer instead.
+        if ((trimmed.startsWith('{') || trimmed.startsWith('[')) && trimmed.length > 1) {
+          try { return textFrom(JSON.parse(trimmed)); } catch { /* ordinary text */ }
+        }
+        return value;
+      }
+      if (Array.isArray(value)) {
+        const final = [...value].reverse().find(item => item && typeof item === 'object' && String(item.step_type || '').toUpperCase() === 'FINAL');
+        return final ? textFrom(final.content?.answer || final.answer || final.content) : value.map(textFrom).join('');
+      }
+      if (value && typeof value === 'object') return textFrom(value.answer || value.text || value.content || value.markdown);
+      return '';
+    };
+    const updateText = (value, status, final = false) => {
+      const next = textFrom(value).trim();
+      if (!next || next.length <= fullText.length) return null;
+      fullText = next;
+      return { text: fullText, citations, status, threadUrl, cursor, final };
+    };
     for (const line of lines) {
       if (!line.startsWith('data: ')) continue;
       let data;
       try { data = JSON.parse(line.slice(6)); } catch { continue; }
+      eventCount++;
+      for (const key of Object.keys(data)) eventShapes.add(key);
       if (data.cursor) cursor = data.cursor;
       if (data.thread_url_slug) threadUrl = `${BASE_URL}/search/${data.thread_url_slug}`;
       if (data.error_code) throw new PerplexityError(data.error_code, data.text || 'Unknown error');
+      const topLevel = updateText(data.answer || data.text || data.content || data.message, data.status, data.status === 'COMPLETED');
+      if (topLevel) yield topLevel;
       if (data.blocks) {
         for (const block of data.blocks) {
-          if (block.markdown_block?.answer) {
-            fullText = block.markdown_block.answer;
-            yield { text: fullText, citations, status: data.status, threadUrl, cursor, final: true };
-          }
-          if (block.markdown_block?.chunks) {
-            const text = block.markdown_block.chunks.join('');
-            if (text.length > fullText.length) {
-              fullText = text;
-              yield { text: fullText, citations, status: data.status, threadUrl, cursor, final: false };
-            }
-          }
+          blockCount++;
+          const markdown = block.markdown_block || block.answer_block || block.text_block || block;
+          const answer = updateText(markdown.answer || markdown.chunks || markdown.text || markdown.content, data.status, data.status === 'COMPLETED');
+          if (answer) yield answer;
           if (block.sources_mode_block?.web_results) {
             citations = block.sources_mode_block.web_results.map(r => ({
               title: r.name || '', url: r.url || '', snippet: r.snippet || '',
@@ -309,7 +336,12 @@ export class PerplexityClient {
         }
       }
     }
-    if (fullText) yield { text: fullText, citations, status: 'COMPLETED', threadUrl, cursor, final: true };
+    if (fullText) {
+      yield { text: fullText, citations, status: 'COMPLETED', threadUrl, cursor, final: true };
+    } else {
+      // Log protocol shape only, never prompt/cookie/raw upstream contents.
+      console.warn('[client] Empty SSE completion', JSON.stringify({ eventCount, blockCount, eventShapes: [...eventShapes].sort(), hasThreadUrl: Boolean(threadUrl), citationCount: citations.length }));
+    }
   }
 
   async ask(queryStr, options = {}) {
@@ -347,10 +379,19 @@ export class PerplexityClient {
   }
 
   async askComplete(queryStr, options = {}) {
-    const stream = await this.ask(queryStr, options);
-    let result = { text: '', citations: [], threadUrl: '' };
-    for await (const chunk of stream) result = { ...result, ...chunk };
-    return result;
+    const retries = Math.max(0, Math.min(Number(options.emptyResponseRetries ?? 1), 2));
+    for (let attempt = 0; attempt <= retries; attempt++) {
+      const stream = await this.ask(queryStr, options);
+      let result = { text: '', citations: [], threadUrl: '' };
+      for await (const chunk of stream) result = { ...result, ...chunk };
+      if (result.text.trim()) return result;
+      if (attempt < retries) {
+        const delay = 3000 + Math.floor(Math.random() * 2000);
+        console.warn(`[client] Empty upstream completion; retrying once in ${delay}ms`);
+        await new Promise(resolve => setTimeout(resolve, delay));
+      }
+    }
+    throw new PerplexityError('EMPTY_COMPLETION', 'Upstream completion contained no answer text after bounded retry');
   }
 
   async enqueueAsk(queryStr, options = {}, label = '') {

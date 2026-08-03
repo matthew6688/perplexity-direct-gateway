@@ -14,10 +14,39 @@ const event = JSON.stringify({
   blocks: [{ markdown_block: { answer: 'stable answer' } }],
 });
 
+const directTextEvent = JSON.stringify({
+  status: 'COMPLETED',
+  thread_url_slug: 'direct-text',
+  text: 'text outside markdown block',
+});
+
+const arrayContentEvent = JSON.stringify({
+  status: 'COMPLETED',
+  content: [{ text: 'array content answer' }],
+});
+
+const alternateBlockEvent = JSON.stringify({
+  status: 'COMPLETED',
+  blocks: [{ text_block: { content: 'alternate block answer' } }],
+});
+
+const workflowEvent = JSON.stringify({
+  status: 'COMPLETED',
+  text: JSON.stringify([
+    { step_type: 'SEARCH_RESULTS', content: { web_results: [{ url: 'https://noise.example' }] } },
+    { step_type: 'FINAL', content: { answer: JSON.stringify({ answer: 'final answer only' }) } },
+  ]),
+});
+
 for (const newline of ['\n', '\r\n']) {
   const result = await collect(`data: ${event}${newline}${newline}`);
   assert.equal(result?.text, 'stable answer');
   assert.equal(result?.threadUrl, 'https://www.perplexity.ai/search/test-thread');
 }
 
-console.log('perplexity SSE newline compatibility: 2 passed');
+assert.equal((await collect(`data: ${directTextEvent}\n\n`))?.text, 'text outside markdown block');
+assert.equal((await collect(`data: ${arrayContentEvent}\n\n`))?.text, 'array content answer');
+assert.equal((await collect(`data: ${alternateBlockEvent}\n\n`))?.text, 'alternate block answer');
+assert.equal((await collect(`data: ${workflowEvent}\n\n`))?.text, 'final answer only');
+
+console.log('perplexity SSE parser compatibility: 6 passed');

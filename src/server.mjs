@@ -56,8 +56,8 @@ function sse(res) {
   });
 }
 
-function buildError(message, type = 'api_error') {
-  return { error: { message, type } };
+function buildError(message, type = 'api_error', code = undefined) {
+  return { error: { message, type, ...(code ? { code } : {}) } };
 }
 
 function buildPrompt(messages) {
@@ -256,7 +256,12 @@ const server = http.createServer(async (req, res) => {
       } catch (e) {
         console.error('Perplexity error:', e.message);
         const status = e.message?.includes('Queue full') ? 429 : 502;
-        return json(res, status, buildError(e.message));
+        const empty = e.code === 'EMPTY_COMPLETION';
+        return json(res, status, buildError(
+          e.message,
+          empty ? 'upstream_empty_completion' : 'api_error',
+          e.code,
+        ));
       }
     }
 
@@ -280,4 +285,12 @@ server.listen(PORT, HOST, () => {
   console.log(`Models: ${MODEL_CATALOG.length} models across 8 providers`);
   console.log(`Queue: serial FIFO, max 50, human-like delays`);
   if (!PROXY_KEY) console.log('PERPLEXITY_PROXY_KEY not set — server is unauthenticated.');
+});
+
+// A bounded launchd restart must not cut off an accepted HTTP response.
+// KeepAlive stays disabled; this only makes explicit SIGTERM deployments tidy.
+process.on('SIGTERM', () => {
+  console.log('SIGTERM received; closing Perplexity Direct Gateway.');
+  server.close(() => process.exit(0));
+  setTimeout(() => process.exit(0), 4_000).unref();
 });

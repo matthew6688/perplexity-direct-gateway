@@ -104,6 +104,24 @@ startup or recovery, start the gateway with
 reported as unhealthy instead of invoking CDP. Refresh the saved session
 explicitly before restarting.
 
+### Completion reliability
+
+The upstream web endpoint can return a successful SSE envelope with citations
+or a workflow trace but without a directly usable answer. The gateway handles
+this without hiding the failure:
+
+- requests `send_back_text_in_streaming_api=true`;
+- extracts the actual `FINAL.answer` from workflow-shaped responses rather
+  than forwarding the search trace;
+- accepts markdown, text, content-array, and alternate answer-block events;
+- performs one bounded retry for an empty completion, then returns a typed
+  `upstream_empty_completion` error (`502`) for the caller's Provider policy
+  to fall back from.
+
+It never retries forever, starts Chrome, or changes models by itself when
+`strict_model` is set. Logs contain only protocol shape/count diagnostics, not
+queries, cookies, or raw source content.
+
 ### Streaming
 
 ```bash
