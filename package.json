@@ -1,6 +1,6 @@
 {
   "name": "perplexity-direct-gateway",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Direct HTTP gateway for Perplexity AI — Aurora-equivalent using cookie auth instead of browser automation",
   "type": "module",
   "scripts": {

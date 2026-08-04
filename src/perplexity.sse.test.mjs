@@ -1,5 +1,10 @@
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import { PerplexityClient } from './perplexity.mjs';
+import { PRODUCT } from './product.mjs';
+
+const packageVersion = JSON.parse(readFileSync(new URL('../package.json', import.meta.url))).version;
+assert.equal(PRODUCT.version, packageVersion, 'runtime product version must match package version');
 
 async function collect(text) {
   const client = new PerplexityClient();

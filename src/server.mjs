@@ -20,6 +20,7 @@ import { existsSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
 import { getClient, uploadFile } from './perplexity.mjs';
+import { PRODUCT } from './product.mjs';
 
 const PORT = parseInt(process.env.PORT || '8788', 10);
 const HOST = process.env.HOST || '127.0.0.1';
@@ -137,6 +138,7 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, {
         status: 'ok',
         provider: 'perplexity-direct',
+        product: PRODUCT,
         queueDepth: client?.queueDepth || 0,
         sessionAlive: client?.cookies?.valid || false,
         cookieAgeSeconds: cookieAge,
@@ -250,6 +252,7 @@ const server = http.createServer(async (req, res) => {
             perplexity: {
               url: result.threadUrl || '',
               model_applied: cleanModel || 'turbo',
+              gateway_product: PRODUCT,
             },
           });
         }
