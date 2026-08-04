@@ -286,6 +286,15 @@ export class PerplexityClient {
     let fullText = '', threadUrl = '', citations = [], cursor = null;
     let eventCount = 0, blockCount = 0;
     const eventShapes = new Set();
+    const blockShapes = new Set();
+    const finalValueShapes = new Set();
+    let lastCompletionFields = {};
+    const describe = (value, path = '', depth = 0) => {
+      if (depth > 3 || value === null || value === undefined) return;
+      if (typeof value === 'string') { if (value.trim()) finalValueShapes.add(`${path}:string:${value.trim().length}`); return; }
+      if (Array.isArray(value)) { finalValueShapes.add(`${path}:array:${value.length}`); value.slice(0, 3).forEach((item, index) => describe(item, `${path}[${index}]`, depth + 1)); return; }
+      if (typeof value === 'object') Object.entries(value).slice(0, 24).forEach(([key, item]) => describe(item, path ? `${path}.${key}` : key, depth + 1));
+    };
     const textFrom = (value) => {
       if (typeof value === 'string') {
         const trimmed = value.trim();
@@ -319,6 +328,9 @@ export class PerplexityClient {
       if (data.cursor) cursor = data.cursor;
       if (data.thread_url_slug) threadUrl = `${BASE_URL}/search/${data.thread_url_slug}`;
       if (data.error_code) throw new PerplexityError(data.error_code, data.text || 'Unknown error');
+      if (data.final !== undefined || data.final_sse_message !== undefined || data.text_completed !== undefined) {
+        lastCompletionFields = { final: data.final, final_sse_message: data.final_sse_message, text_completed: data.text_completed };
+      }
       // Perplexity has moved the final prose between several SSE fields over
       // time. `final` and `final_sse_message` are now common on responses
       // that otherwise contain only citation / workflow blocks. Prefer these
@@ -334,6 +346,7 @@ export class PerplexityClient {
       if (data.blocks) {
         for (const block of data.blocks) {
           blockCount++;
+          if (block && typeof block === 'object') blockShapes.add(Object.keys(block).sort().join(','));
           const markdown = block.markdown_block || block.answer_block || block.text_block || block;
           const answer = updateText(markdown.answer || markdown.chunks || markdown.text || markdown.content, data.status, data.status === 'COMPLETED');
           if (answer) yield answer;
@@ -350,7 +363,8 @@ export class PerplexityClient {
       yield { text: fullText, citations, status: 'COMPLETED', threadUrl, cursor, final: true };
     } else {
       // Log protocol shape only, never prompt/cookie/raw upstream contents.
-      console.warn('[client] Empty SSE completion', JSON.stringify({ eventCount, blockCount, eventShapes: [...eventShapes].sort(), hasThreadUrl: Boolean(threadUrl), citationCount: citations.length }));
+      describe(lastCompletionFields);
+      console.warn('[client] Empty SSE completion', JSON.stringify({ eventCount, blockCount, eventShapes: [...eventShapes].sort(), blockShapes: [...blockShapes].sort(), finalValueShapes: [...finalValueShapes].sort(), hasThreadUrl: Boolean(threadUrl), citationCount: citations.length }));
     }
   }
 
