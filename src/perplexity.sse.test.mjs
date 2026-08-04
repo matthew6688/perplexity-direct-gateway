@@ -38,6 +38,17 @@ const workflowEvent = JSON.stringify({
   ]),
 });
 
+const finalMessageEvent = JSON.stringify({
+  status: 'COMPLETED',
+  final_sse_message: { answer: 'answer carried by final SSE message' },
+  blocks: [{ sources_mode_block: { web_results: [{ name: 'source', url: 'https://source.example' }] } }],
+});
+
+const textCompletedEvent = JSON.stringify({
+  status: 'COMPLETED',
+  text_completed: { content: { answer: 'answer carried by text completed' } },
+});
+
 for (const newline of ['\n', '\r\n']) {
   const result = await collect(`data: ${event}${newline}${newline}`);
   assert.equal(result?.text, 'stable answer');
@@ -48,5 +59,7 @@ assert.equal((await collect(`data: ${directTextEvent}\n\n`))?.text, 'text outsid
 assert.equal((await collect(`data: ${arrayContentEvent}\n\n`))?.text, 'array content answer');
 assert.equal((await collect(`data: ${alternateBlockEvent}\n\n`))?.text, 'alternate block answer');
 assert.equal((await collect(`data: ${workflowEvent}\n\n`))?.text, 'final answer only');
+assert.equal((await collect(`data: ${finalMessageEvent}\n\n`))?.text, 'answer carried by final SSE message');
+assert.equal((await collect(`data: ${textCompletedEvent}\n\n`))?.text, 'answer carried by text completed');
 
-console.log('perplexity SSE parser compatibility: 6 passed');
+console.log('perplexity SSE parser compatibility: 8 passed');

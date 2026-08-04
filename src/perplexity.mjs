@@ -319,7 +319,17 @@ export class PerplexityClient {
       if (data.cursor) cursor = data.cursor;
       if (data.thread_url_slug) threadUrl = `${BASE_URL}/search/${data.thread_url_slug}`;
       if (data.error_code) throw new PerplexityError(data.error_code, data.text || 'Unknown error');
-      const topLevel = updateText(data.answer || data.text || data.content || data.message, data.status, data.status === 'COMPLETED');
+      // Perplexity has moved the final prose between several SSE fields over
+      // time. `final` and `final_sse_message` are now common on responses
+      // that otherwise contain only citation / workflow blocks. Prefer these
+      // completion fields before older streaming fields so a successful search
+      // is never misclassified as an empty answer.
+      const topLevel = updateText(
+        data.final_sse_message || data.final || data.text_completed ||
+        data.answer || data.text || data.content || data.message,
+        data.status,
+        data.status === 'COMPLETED',
+      );
       if (topLevel) yield topLevel;
       if (data.blocks) {
         for (const block of data.blocks) {
