@@ -110,10 +110,13 @@ The upstream web endpoint can return a successful SSE envelope with citations
 or a workflow trace but without a directly usable answer. The gateway handles
 this without hiding the failure:
 
-- requests `send_back_text_in_streaming_api=true`;
+- requests the conservative markdown-and-sources block contract instead of
+  opting into upstream UI/workflow blocks;
 - extracts the actual `FINAL.answer` from workflow-shaped responses rather
   than forwarding the search trace;
 - accepts markdown, text, content-array, and alternate answer-block events;
+- recovers public source URLs embedded in a text-only answer when upstream
+  omits a structured sources block;
 - performs one bounded retry for an empty completion, then returns a typed
   `upstream_empty_completion` error (`502`) for the caller's Provider policy
   to fall back from.

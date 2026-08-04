@@ -218,24 +218,16 @@ export class PerplexityClient {
         time_from_first_type: typingTime(queryStr.length),
         local_search_enabled: false,
         use_schematized_api: true,
-        // The upstream API occasionally emits citations and completion status
-        // without a markdown block when this is false. We need the answer in
-        // the SSE body so an empty completion is observable and retryable.
-        send_back_text_in_streaming_api: true,
-        supported_block_use_cases: [
-          'answer_modes', 'media_items', 'knowledge_cards',
-          'inline_entity_cards', 'place_widgets', 'finance_widgets',
-          'sports_widgets', 'news_widgets', 'shopping_widgets',
-          'jobs_widgets', 'search_result_widgets', 'inline_images',
-          'inline_assets', 'placeholder_cards', 'diff_blocks',
-          'inline_knowledge_cards', 'entity_group_v2', 'refinement_filters',
-          'canvas_mode', 'maps_preview', 'answer_tabs',
-          'price_comparison_widgets', 'preserve_latex',
-          'generic_onboarding_widgets', 'in_context_suggestions',
-          'pending_followups', 'inline_claims', 'unified_assets',
-          'workflow_steps', 'workflow_widgets', 'navigation_results',
-          'background_agents', 'markdown_block', 'sources_mode_block',
-        ],
+        // This is the long-running stable request shape. Setting it to true
+        // changes Perplexity's SSE block protocol and has produced streams
+        // with citations but no parsable answer body under production load.
+        // Keep the established markdown-block response shape; the parser
+        // still accepts alternate completion fields for forward compatibility.
+        send_back_text_in_streaming_api: false,
+        // Request only the two blocks this gateway actually persists. Asking
+        // for UI/workflow blocks lets upstream select an answer-tabs workflow
+        // protocol that contains citations but no durable prose payload.
+        supported_block_use_cases: ['markdown_block', 'sources_mode_block'],
         client_coordinates: null, mentions: [],
         skip_search_enabled: true, is_nav_suggestions_disabled: false,
         followup_source: 'link', source: 'default',
@@ -289,6 +281,7 @@ export class PerplexityClient {
     const blockShapes = new Set();
     const finalValueShapes = new Set();
     let lastCompletionFields = {};
+    let lastProtocolFields = {};
     const describe = (value, path = '', depth = 0) => {
       if (depth > 3 || value === null || value === undefined) return;
       if (typeof value === 'string') { if (value.trim()) finalValueShapes.add(`${path}:string:${value.trim().length}`); return; }
@@ -331,6 +324,9 @@ export class PerplexityClient {
       if (data.final !== undefined || data.final_sse_message !== undefined || data.text_completed !== undefined) {
         lastCompletionFields = { final: data.final, final_sse_message: data.final_sse_message, text_completed: data.text_completed };
       }
+      if (data.answer_modes !== undefined || data.blocks !== undefined) {
+        lastProtocolFields = { answer_modes: data.answer_modes, blocks: data.blocks };
+      }
       // Perplexity has moved the final prose between several SSE fields over
       // time. `final` and `final_sse_message` are now common on responses
       // that otherwise contain only citation / workflow blocks. Prefer these
@@ -360,10 +356,23 @@ export class PerplexityClient {
       }
     }
     if (fullText) {
+      // Some current upstream text-only responses render source URLs inline
+      // while omitting `sources_mode_block`. Preserve those public sources so
+      // downstream research receipts never lose their evidence trail.
+      if (citations.length === 0) {
+        const seen = new Set();
+        for (const match of fullText.matchAll(/https?:\/\/[^\s)\]}>,]+/g)) {
+          const url = match[0].replace(/[.,;:]+$/, '');
+          if (!seen.has(url)) {
+            seen.add(url);
+            citations.push({ title: '', url, snippet: '' });
+          }
+        }
+      }
       yield { text: fullText, citations, status: 'COMPLETED', threadUrl, cursor, final: true };
     } else {
       // Log protocol shape only, never prompt/cookie/raw upstream contents.
-      describe(lastCompletionFields);
+      describe({ ...lastCompletionFields, ...lastProtocolFields });
       console.warn('[client] Empty SSE completion', JSON.stringify({ eventCount, blockCount, eventShapes: [...eventShapes].sort(), blockShapes: [...blockShapes].sort(), finalValueShapes: [...finalValueShapes].sort(), hasThreadUrl: Boolean(threadUrl), citationCount: citations.length }));
     }
   }

@@ -49,6 +49,11 @@ const textCompletedEvent = JSON.stringify({
   text_completed: { content: { answer: 'answer carried by text completed' } },
 });
 
+const inlineSourceEvent = JSON.stringify({
+  status: 'COMPLETED',
+  blocks: [{ markdown_block: { answer: 'Evidence: https://example.com/source.' } }],
+});
+
 for (const newline of ['\n', '\r\n']) {
   const result = await collect(`data: ${event}${newline}${newline}`);
   assert.equal(result?.text, 'stable answer');
@@ -61,5 +66,7 @@ assert.equal((await collect(`data: ${alternateBlockEvent}\n\n`))?.text, 'alterna
 assert.equal((await collect(`data: ${workflowEvent}\n\n`))?.text, 'final answer only');
 assert.equal((await collect(`data: ${finalMessageEvent}\n\n`))?.text, 'answer carried by final SSE message');
 assert.equal((await collect(`data: ${textCompletedEvent}\n\n`))?.text, 'answer carried by text completed');
+const inlineSource = await collect(`data: ${inlineSourceEvent}\n\n`);
+assert.equal(inlineSource?.citations?.[0]?.url, 'https://example.com/source');
 
-console.log('perplexity SSE parser compatibility: 8 passed');
+console.log('perplexity SSE parser compatibility: 9 passed');
